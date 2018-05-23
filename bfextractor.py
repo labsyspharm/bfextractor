@@ -61,7 +61,7 @@ reader_class_name = sys.argv[3]
 
 TILE_SIZE = 1024
 
-client = boto3.client('s3')
+s3 = boto3.client('s3')
 bucket = 'jmuhlich-bfextractor-test'
 
 file_path = bfu_dir.resolve() / filename
@@ -96,7 +96,7 @@ ext = 'png'
 content_type = 'image/png'
 
 
-with s3transfer.manager.TransferManager(client) as transfer_manager:
+with s3transfer.manager.TransferManager(s3) as transfer_manager:
 
     upload_futures = []
 
