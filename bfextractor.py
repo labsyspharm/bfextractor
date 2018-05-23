@@ -1,5 +1,6 @@
 import warnings
 import sys
+import os
 import io
 import itertools
 import pathlib
@@ -58,11 +59,11 @@ DebugTools.enableLogging(JString("ERROR"))
 bfu_dir = pathlib.Path(sys.argv[1])
 filename = pathlib.Path(sys.argv[2])
 reader_class_name = sys.argv[3]
+bucket = os.environ['BUCKET_TILE']
 
 TILE_SIZE = 1024
 
 s3 = boto3.client('s3')
-bucket = 'jmuhlich-bfextractor-test'
 
 file_path = bfu_dir.resolve() / filename
 
@@ -131,7 +132,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                     skimage.io.imsave(buf, tile_img, format_str=ext)
                 buf.seek(0)
 
-                tile_key = str(pathlib.Path('tiletest') / img_id / filename)
+                tile_key = str(pathlib.Path(img_id) / filename)
                 # FIXME Tighten ACL.
                 upload_args=dict(ACL='public-read', ContentType=content_type)
                 future = transfer_manager.upload(
