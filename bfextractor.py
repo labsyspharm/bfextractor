@@ -59,7 +59,7 @@ DebugTools.enableLogging(JString("ERROR"))
 bfu_dir = pathlib.Path(sys.argv[1])
 filename = pathlib.Path(sys.argv[2])
 reader_class_name = sys.argv[3]
-bucket = os.environ['BUCKET_TILE']
+bucket = sys.argv[4]
 
 TILE_SIZE = 1024
 
