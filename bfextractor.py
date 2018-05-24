@@ -5,6 +5,7 @@ import io
 import itertools
 import pathlib
 import uuid
+import json
 import boto3
 import s3transfer.manager
 import s3transfer.subscribers
@@ -12,7 +13,6 @@ import numpy as np
 import skimage.io
 import skimage.transform
 import jnius
-
 
 
 def tile(img, n):
@@ -60,10 +60,18 @@ bfu_dir = pathlib.Path(sys.argv[1])
 filename = pathlib.Path(sys.argv[2])
 reader_class_name = sys.argv[3]
 bucket = sys.argv[4]
+stack_prefix = os.environ['STACKPREFIX']
+stage = os.environ['STAGE']
 
 TILE_SIZE = 1024
 
 s3 = boto3.client('s3')
+ssm = boto3.client('ssm')
+lmb = boto3.client('lambda')
+
+image_register_arn = ssm.get_parameter(
+    Name='/{}/{}/batch/RegisterImageLambdaARN'.format(stack_prefix, stage)
+)['Parameter']['Value']
 
 file_path = bfu_dir.resolve() / filename
 
@@ -110,6 +118,9 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
         img_id = str(uuid.uuid4())
         print(f'Allocated ID for series {series}: {img_id}')
 
+        # TODO Better way to get number of levels
+        max_level = 0
+
         for c, z, t in itertools.product(rc, rz, rt):
 
             index = reader.getIndex(z, c, t)
@@ -118,9 +129,13 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
             # at least for Metamorph datasets with one different-sized image.
             # Is this a broad BioFormats issue or just that reader?
             shape = (reader.sizeY, reader.sizeX)
-            img = np.frombuffer(byte_array.tostring(), dtype=dtype).reshape(shape)
+            img = np.frombuffer(byte_array.tostring(), dtype=dtype)
+            img = img.reshape(shape)
 
             for level, ty, tx, tile_img in build_pyramid(img, TILE_SIZE):
+
+                if level > max_level:
+                    max_level = level
 
                 filename = f'C{c}-T{t}-Z{z}-L{level}-Y{ty}-X{tx}.{ext}'
                 buf = io.BytesIO()
@@ -133,12 +148,21 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                 buf.seek(0)
 
                 tile_key = str(pathlib.Path(img_id) / filename)
-                # FIXME Tighten ACL.
-                upload_args=dict(ACL='public-read', ContentType=content_type)
+
                 future = transfer_manager.upload(
-                    buf, bucket, tile_key, extra_args=upload_args,
-                )
+                    buf, bucket, tile_key)
                 upload_futures.append(future)
+
+        # TODO Do this in another thread and only when it has sucesfully been
+        # tiled and uploaded
+        lmb.invoke(
+            FunctionName=image_register_arn,
+            Payload=str.encode(json.dumps({
+                'bfuUuid': bfu_dir,
+                'imageUuid': img_id,
+                'pyramidLevels': max_level + 1
+            }))
+        )
 
     for future in upload_futures:
         future.result()
