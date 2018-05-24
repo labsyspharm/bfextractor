@@ -1,0 +1,20 @@
+version: '3'
+services:
+  bfextractor:
+    build: .
+    environment:
+      AWS_REGION: ""
+      AWS_ACCESS_KEY_ID: ""
+      AWS_SECRET_ACCESS_KEY: ""
+      AWS_SESSION_TOKEN: ""
+    volumes:
+      - /data:/tmp/aws
+    command:
+      # Import UUID and also the directory name within /data
+      - importUuid
+      # Location of entrypoint within importUuid directory
+      - path/to/entrypoint/example.dv
+      # Identify for the Bio-Formats Reader
+      - loci.formats.in.DeltavisionReader
+      # Bucket in which to write tiles
+      - jmuhlich-bfextractor-test
