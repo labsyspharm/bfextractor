@@ -155,6 +155,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
 
         # TODO Do this in another thread and only when it has sucesfully been
         # tiled and uploaded
+        print('Registering image {} in BFU {}'.format(img_id, bfu_dir))
         lmb.invoke(
             FunctionName=image_register_arn,
             Payload=str.encode(json.dumps({
