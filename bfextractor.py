@@ -158,7 +158,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
         lmb.invoke(
             FunctionName=image_register_arn,
             Payload=str.encode(json.dumps({
-                'bfuUuid': bfu_dir,
+                'bfuUuid': str(bfu_dir),
                 'imageUuid': img_id,
                 'pyramidLevels': max_level + 1
             }))
