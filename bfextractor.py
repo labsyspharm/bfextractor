@@ -56,10 +56,11 @@ ClassList = jnius.autoclass('loci.formats.ClassList')
 DebugTools.enableLogging(JString("ERROR"))
 
 
-bfu_dir = pathlib.Path(sys.argv[1])
+import_uuid = pathlib.Path(sys.argv[1])
 filename = pathlib.Path(sys.argv[2])
 reader_class_name = sys.argv[3]
 bucket = sys.argv[4]
+bfu_uuid = sys.argv[5]
 stack_prefix = os.environ['STACKPREFIX']
 stage = os.environ['STAGE']
 
@@ -73,7 +74,7 @@ image_register_arn = ssm.get_parameter(
     Name='/{}/{}/batch/RegisterImageLambdaARN'.format(stack_prefix, stage)
 )['Parameter']['Value']
 
-file_path = bfu_dir.resolve() / filename
+file_path = import_uuid.resolve() / filename
 
 single = ClassList(IFormatReader)
 for cls in ImageReader.getDefaultReaderClasses().getClasses():
@@ -155,11 +156,11 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
 
         # TODO Do this in another thread and only when it has sucesfully been
         # tiled and uploaded
-        print('Registering image {} in BFU {}'.format(img_id, bfu_dir))
+        print('Registering image {} in BFU {}'.format(img_id, bfu_uuid))
         lmb.invoke(
             FunctionName=image_register_arn,
             Payload=str.encode(json.dumps({
-                'bfuUuid': str(bfu_dir),
+                'bfuUuid': bfu_uuid,
                 'imageUuid': img_id,
                 'pyramidLevels': max_level + 1
             }))
