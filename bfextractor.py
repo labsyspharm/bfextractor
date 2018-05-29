@@ -6,6 +6,7 @@ import itertools
 import pathlib
 import uuid
 import json
+from xml.etree import ElementTree
 import boto3
 import s3transfer.manager
 import s3transfer.subscribers
@@ -13,6 +14,9 @@ import numpy as np
 import skimage.io
 import skimage.transform
 import jnius
+
+
+OME_NS = 'http://www.openmicroscopy.org/Schemas/OME/2016-06'
 
 
 def tile(img, n):
@@ -33,6 +37,16 @@ def build_pyramid(img, n):
                 )
                 tile_img = skimage.util.dtype.convert(tile_img, img.dtype)
             yield layer, yi, xi, tile_img
+
+
+def transform_xml(metadata, id_map):
+    ElementTree.register_namespace('', OME_NS)
+    xml_root = ElementTree.fromstring(metadata.dumpXML())
+    iterfind = lambda m: xml_root.iterfind(f'ome:{m}', {'ome': OME_NS})
+    for elt in itertools.chain(iterfind('Image'), iterfind('ImageRef')):
+        elt.attrib['ID'] = image_id_map[elt.attrib['ID']]
+    xml_str = ElementTree.tostring(xml_root, encoding='utf-8')
+    return xml_str
 
 
 class ProgressSubscriber(s3transfer.subscribers.BaseSubscriber):
@@ -60,7 +74,7 @@ import_uuid = pathlib.Path(sys.argv[1])
 filename = pathlib.Path(sys.argv[2])
 reader_class_name = sys.argv[3]
 bucket = sys.argv[4]
-bfu_uuid = sys.argv[5]
+bfu_uuid = pathlib.Path(sys.argv[5])
 stack_prefix = os.environ['STACKPREFIX']
 stage = os.environ['STAGE']
 
@@ -102,13 +116,14 @@ assert metadata.getPixelsType(0).value == 'uint16', \
 dtype = np.uint16
 
 # FIXME Consider other file types to support higher-depth pixel formats.
-ext = 'png'
-content_type = 'image/png'
+tile_ext = 'png'
+tile_content_type = 'image/png'
 
 
 with s3transfer.manager.TransferManager(s3) as transfer_manager:
 
     upload_futures = []
+    image_id_map = {}
 
     for series in range(reader.getSeriesCount()):
 
@@ -117,6 +132,8 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
         rz = range(reader.sizeZ)
         rt = range(reader.sizeT)
         img_id = str(uuid.uuid4())
+        old_xml_id = metadata.getImageID(series)
+        image_id_map[old_xml_id] = f'Image:{img_id}'
         print(f'Allocated ID for series {series}: {img_id}')
 
         # TODO Better way to get number of levels
@@ -138,33 +155,44 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                 if level > max_level:
                     max_level = level
 
-                filename = f'C{c}-T{t}-Z{z}-L{level}-Y{ty}-X{tx}.{ext}'
+                filename = f'C{c}-T{t}-Z{z}-L{level}-Y{ty}-X{tx}.{tile_ext}'
                 buf = io.BytesIO()
                 with warnings.catch_warnings():
                     warnings.filterwarnings(
                         'ignore', r'.* is a low contrast image', UserWarning,
                         '^skimage\.io'
                     )
-                    skimage.io.imsave(buf, tile_img, format_str=ext)
+                    skimage.io.imsave(buf, tile_img, format_str=tile_ext)
                 buf.seek(0)
 
                 tile_key = str(pathlib.Path(img_id) / filename)
+                upload_args=dict(ContentType=tile_content_type)
 
                 future = transfer_manager.upload(
-                    buf, bucket, tile_key)
+                    buf, bucket, tile_key, extra_args=upload_args
+                )
                 upload_futures.append(future)
 
         # TODO Do this in another thread and only when it has sucesfully been
         # tiled and uploaded
-        print('Registering image {} in BFU {}'.format(img_id, bfu_uuid))
+        print('Registering image {} in BFU {}'.format(img_id, str(bfu_uuid)))
         lmb.invoke(
             FunctionName=image_register_arn,
             Payload=str.encode(json.dumps({
-                'bfuUuid': bfu_uuid,
+                'bfuUuid': str(bfu_uuid),
                 'imageUuid': img_id,
                 'pyramidLevels': max_level + 1
             }))
         )
+
+    xml_key = str(bfu_uuid / 'metadata.xml')
+    xml_bytes = transform_xml(metadata, image_id_map)
+    xml_buf = io.BytesIO(xml_bytes)
+    upload_args=dict(ContentType='application/xml')
+    future = transfer_manager.upload(
+        xml_buf, bucket, xml_key, extra_args=upload_args
+    )
+    upload_futures.append(future)
 
     for future in upload_futures:
         future.result()
