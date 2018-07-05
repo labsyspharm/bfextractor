@@ -78,14 +78,20 @@ bfu_uuid = pathlib.Path(sys.argv[5])
 stack_prefix = os.environ['STACKPREFIX']
 stage = os.environ['STAGE']
 
+try:
+    debug = os.environ['DEBUG'].upper() == 'TRUE'
+except KeyError:
+    debug = False
+
 TILE_SIZE = 1024
+IMAGE_NAME_LENGTH = 256
 
 s3 = boto3.client('s3')
 ssm = boto3.client('ssm')
 lmb = boto3.client('lambda')
 
-image_register_arn = ssm.get_parameter(
-    Name='/{}/{}/batch/RegisterImageLambdaARN'.format(stack_prefix, stage)
+set_bfu_complete_arn = ssm.get_parameter(
+    Name='/{}/{}/api/SetBFUCompleteLambdaARN'.format(stack_prefix, stage)
 )['Parameter']['Value']
 
 file_path = import_uuid.resolve() / filename
@@ -118,14 +124,27 @@ dtype = np.uint16
 # FIXME Consider other file types to support higher-depth pixel formats.
 tile_ext = 'png'
 tile_content_type = 'image/png'
+series_count = reader.getSeriesCount()
+series_digits = len(str(series_count))
+
+
+def mk_name(file_path, n):
+    stem = file_path.stem
+    if series_count > 1:
+        n = str(n).zfill(series_digits)
+        suffix = f'[{n}]'
+    else:
+        suffix = ''
+    return stem[:IMAGE_NAME_LENGTH - len(suffix)] + suffix
 
 
 with s3transfer.manager.TransferManager(s3) as transfer_manager:
 
     upload_futures = []
     image_id_map = {}
+    images = []
 
-    for series in range(reader.getSeriesCount()):
+    for series in range(series_count):
 
         reader.setSeries(series)
         rc = range(reader.sizeC)
@@ -173,17 +192,12 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                 )
                 upload_futures.append(future)
 
-        # TODO Do this in another thread and only when it has sucesfully been
-        # tiled and uploaded
-        print('Registering image {} in BFU {}'.format(img_id, str(bfu_uuid)))
-        lmb.invoke(
-            FunctionName=image_register_arn,
-            Payload=str.encode(json.dumps({
-                'bfuUuid': str(bfu_uuid),
-                'imageUuid': img_id,
-                'pyramidLevels': max_level + 1
-            }))
-        )
+        # Add this new image to the list to be attached to this BFU
+        images.append({
+            'uuid': img_id,
+            'name': mk_name(file_path, series),
+            'pyramid_levels': max_level + 1
+        })
 
     xml_key = str(bfu_uuid / 'metadata.xml')
     xml_bytes = transform_xml(metadata, image_id_map)
@@ -196,3 +210,18 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
 
     for future in upload_futures:
         future.result()
+
+    print('Completing BFU {} and registering images: {}'.format(
+        bfu_uuid,
+        ', '.join([image['uuid'] for image in images])
+    ))
+
+    if not debug:
+
+        lmb.invoke(
+            FunctionName=set_bfu_complete_arn,
+            Payload=str.encode(json.dumps({
+                'bfu_uuid': bfu_uuid,
+                'images': images
+            }))
+        )
