@@ -185,7 +185,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                 buf.seek(0)
 
                 tile_key = str(pathlib.Path(img_id) / filename)
-                upload_args=dict(ContentType=tile_content_type)
+                upload_args = dict(ContentType=tile_content_type)
 
                 future = transfer_manager.upload(
                     buf, bucket, tile_key, extra_args=upload_args
@@ -202,7 +202,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
     xml_key = str(bfu_uuid / 'metadata.xml')
     xml_bytes = transform_xml(metadata, image_id_map)
     xml_buf = io.BytesIO(xml_bytes)
-    upload_args=dict(ContentType='application/xml')
+    upload_args = dict(ContentType='application/xml')
     future = transfer_manager.upload(
         xml_buf, bucket, xml_key, extra_args=upload_args
     )
@@ -221,7 +221,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
         lmb.invoke(
             FunctionName=set_bfu_complete_arn,
             Payload=str.encode(json.dumps({
-                'bfu_uuid': bfu_uuid,
+                'bfu_uuid': str(bfu_uuid),
                 'images': images
             }))
         )
