@@ -42,11 +42,45 @@ def build_pyramid(img, n):
 def transform_xml(metadata, id_map):
     ElementTree.register_namespace('', OME_NS)
     xml_root = ElementTree.fromstring(metadata.dumpXML())
+    missing = []
     iterfind = lambda m: xml_root.iterfind(f'ome:{m}', {'ome': OME_NS})
+    # Replace original image ID attributes with our UUID-based IDs.
     for elt in itertools.chain(iterfind('Image'), iterfind('ImageRef')):
-        elt.attrib['ID'] = image_id_map[elt.attrib['ID']]
+        new_id = id_map.get(elt.attrib['ID'])
+        if new_id is not None:
+            elt.attrib['ID'] = new_id
+        else:
+            # Keep a list of elements missing from the map.
+            missing.append(elt)
+    # Drop the missing elements. This is currently only meant to handle Faas
+    # pyramids where we need to drop the subresolution images.
+    for elt in missing:
+        # We should only ever see Image elements in this list.
+        if elt.tag == f'{{{OME_NS}}}Image':
+            xml_root.remove(elt)
+        else:
+            raise ValueError('Unexpected reference to dropped image')
     xml_str = ElementTree.tostring(xml_root, encoding='utf-8')
     return xml_str
+
+
+def is_faas_pyramid(image_reader):
+    """Return True if this is an OME-TIFF containing a 'Faas' pyramid."""
+    format_reader = image_reader.getReader()
+    if format_reader.format == 'OME-TIFF':
+        # This cast does something to the internals of OMETiffReader that seems
+        # to be required to make the getClass call on the next line work. It
+        # looks like a bug in jnius.
+        format_reader = jnius.cast(OMETiffReader, format_reader)
+        # Peek at the protected 'info' field through reflection.
+        field_info = OMETiffReader.getClass().getDeclaredField(JString('info'))
+        info = field_info.get(format_reader)
+        tiff_reader = jnius.cast(MinimalTiffReader, info[0][0].reader)
+        ifd = tiff_reader.getIFDs().get(0)
+        software = ifd.getIFDStringValue(IFD.SOFTWARE)
+        if 'Faas' in software:
+            return True
+    return False
 
 
 class ProgressSubscriber(s3transfer.subscribers.BaseSubscriber):
@@ -57,6 +91,11 @@ class ProgressSubscriber(s3transfer.subscribers.BaseSubscriber):
     def on_done(self, future, **kwargs):
         print(f'Upload completed: {self.subkey}')
 
+# The wrapper for Field provided by jnius only includes a few methods, and 'get'
+# is not one of them. We'll monkey-patch it in here.
+jnius.reflect.Field.get = jnius.reflect.JavaMethod(
+    '(Ljava/lang/Object;)Ljava/lang/Object;'
+)
 
 JString = jnius.autoclass('java.lang.String')
 DebugTools = jnius.autoclass('loci.common.DebugTools')
@@ -66,6 +105,9 @@ ServiceFactory = jnius.autoclass('loci.common.services.ServiceFactory')
 OMEXMLService = jnius.autoclass('loci.formats.services.OMEXMLService')
 ImageReader = jnius.autoclass('loci.formats.ImageReader')
 ClassList = jnius.autoclass('loci.formats.ClassList')
+OMETiffReader = jnius.autoclass('loci.formats.in.OMETiffReader')
+MinimalTiffReader = jnius.autoclass('loci.formats.in.MinimalTiffReader')
+IFD = jnius.autoclass('loci.formats.tiff.IFD')
 
 DebugTools.enableLogging(JString("ERROR"))
 
@@ -125,6 +167,9 @@ dtype = np.uint16
 tile_ext = 'png'
 tile_content_type = 'image/png'
 series_count = reader.getSeriesCount()
+# Ignore subresolutions in Faas pyramids.
+if is_faas_pyramid(reader):
+    series_count = 1
 series_digits = len(str(series_count))
 
 
