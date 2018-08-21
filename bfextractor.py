@@ -115,8 +115,10 @@ DebugTools.enableLogging(JString("ERROR"))
 import_uuid = pathlib.Path(sys.argv[1])
 filename = pathlib.Path(sys.argv[2])
 reader_class_name = sys.argv[3]
-bucket = sys.argv[4]
-bfu_uuid = pathlib.Path(sys.argv[5])
+reader_software = sys.argv[4]
+reader_version = sys.argv[5]
+bucket = sys.argv[6]
+fileset_uuid = pathlib.Path(sys.argv[7])
 stack_prefix = os.environ['STACKPREFIX']
 stage = os.environ['STAGE']
 
@@ -132,8 +134,8 @@ s3 = boto3.client('s3')
 ssm = boto3.client('ssm')
 lmb = boto3.client('lambda')
 
-set_bfu_complete_arn = ssm.get_parameter(
-    Name='/{}/{}/api/SetBFUCompleteLambdaARN'.format(stack_prefix, stage)
+set_fileset_complete_arn = ssm.get_parameter(
+    Name='/{}/{}/api/SetFilesetCompleteLambdaARN'.format(stack_prefix, stage)
 )['Parameter']['Value']
 
 file_path = import_uuid.resolve() / filename
@@ -237,14 +239,14 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                 )
                 upload_futures.append(future)
 
-        # Add this new image to the list to be attached to this BFU
+        # Add this new image to the list to be attached to this Fileset
         images.append({
             'uuid': img_id,
             'name': mk_name(file_path, series),
             'pyramid_levels': max_level + 1
         })
 
-    xml_key = str(bfu_uuid / 'metadata.xml')
+    xml_key = str(fileset_uuid / 'metadata.xml')
     xml_bytes = transform_xml(metadata, image_id_map)
     xml_buf = io.BytesIO(xml_bytes)
     upload_args = dict(ContentType='application/xml')
@@ -256,17 +258,17 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
     for future in upload_futures:
         future.result()
 
-    print('Completing BFU {} and registering images: {}'.format(
-        bfu_uuid,
+    print('Completing Fileset {} and registering images: {}'.format(
+        fileset_uuid,
         ', '.join([image['uuid'] for image in images])
     ))
 
     if not debug:
 
         lmb.invoke(
-            FunctionName=set_bfu_complete_arn,
+            FunctionName=set_fileset_complete_arn,
             Payload=str.encode(json.dumps({
-                'bfu_uuid': str(bfu_uuid),
+                'fileset_uuid': str(fileset_uuid),
                 'images': images
             }))
         )

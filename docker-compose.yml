@@ -19,6 +19,10 @@ services:
       - path/to/entrypoint/example.dv
       # Identify for the Bio-Formats Reader
       - loci.formats.in.DeltavisionReader
+      # Reader Software Name
+      - Bio-Formats
+      # Reader Software Version
+      - UNKNOWN
       # Bucket in which to write tiles
       - jmuhlich-bfextractor-test
       # BFU UUID
