@@ -132,12 +132,13 @@ TILE_SIZE = 1024
 IMAGE_NAME_LENGTH = 256
 
 s3 = boto3.client('s3')
-ssm = boto3.client('ssm')
 lmb = boto3.client('lambda')
 
-set_fileset_complete_arn = ssm.get_parameter(
-    Name='/{}/{}/api/SetFilesetCompleteLambdaARN'.format(stack_prefix, stage)
-)['Parameter']['Value']
+if not debug:
+    ssm = boto3.client('ssm')
+    set_fileset_complete_arn = ssm.get_parameter(
+        Name=f'/{stack_prefix}/{stage}/api/SetFilesetCompleteLambdaARN'
+    )['Parameter']['Value']
 
 file_path = import_uuid.resolve() / filename
 
