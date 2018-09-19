@@ -104,6 +104,7 @@ MetadataStore = jnius.autoclass('loci.formats.meta.MetadataStore')
 ServiceFactory = jnius.autoclass('loci.common.services.ServiceFactory')
 OMEXMLService = jnius.autoclass('loci.formats.services.OMEXMLService')
 ImageReader = jnius.autoclass('loci.formats.ImageReader')
+ChannelSeparator = jnius.autoclass('loci.formats.ChannelSeparator')
 ClassList = jnius.autoclass('loci.formats.ClassList')
 OMETiffReader = jnius.autoclass('loci.formats.in.OMETiffReader')
 MinimalTiffReader = jnius.autoclass('loci.formats.in.MinimalTiffReader')
@@ -152,18 +153,23 @@ factory = ServiceFactory()
 service = jnius.cast(OMEXMLService, factory.getInstance(OMEXMLService))
 metadata = service.createOMEXMLMetadata()
 
-reader = ImageReader(single)
+reader = ChannelSeparator(ImageReader(single))
 reader.setFlattenedResolutions(False)
 reader.setMetadataStore(metadata)
 # FIXME Workaround for pyjnius #300 via explicit String conversion.
 reader.setId(JString(str(file_path)))
 
-# FIXME Implement RGB support.
-assert not reader.isRGB(), "RGB images not yet supported"
-# FIXME Handle other data types.
-assert metadata.getPixelsType(0).value == 'uint16', \
-    "Only uint16 images currently supported"
-dtype = np.uint16
+# FIXME Handle other data types?
+supported_dtypes = {
+    'uint8': np.uint8,
+    'uint16': np.uint16,
+}
+ome_pixel_type = metadata.getPixelsType(0).value
+try:
+    dtype = supported_dtypes[ome_pixel_type]
+except KeyError as e:
+    msg = f"Pixel type '{ome_pixel_type}' is not supported"
+    raise RuntimeError(msg) from None
 
 # FIXME Consider other file types to support higher-depth pixel formats.
 tile_ext = 'png'
