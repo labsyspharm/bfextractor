@@ -26,7 +26,7 @@ def tile(img, n):
 
 
 def build_pyramid(img, n):
-    max_layer = max(np.ceil(np.log2(np.array(img.shape) / n)))
+    max_layer = max(max(np.ceil(np.log2(np.array(img.shape) / n))), 0)
     pyramid = skimage.transform.pyramid_gaussian(img, max_layer=max_layer)
     for layer, layer_img in enumerate(pyramid):
         for yi, xi, tile_img in tile(layer_img, n):
