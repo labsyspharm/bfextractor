@@ -27,7 +27,7 @@ def tile(img, n):
 
 def build_pyramid(img, n):
     max_layer = max(max(np.ceil(np.log2(np.array(img.shape) / n))), 0)
-    pyramid = skimage.transform.pyramid_gaussian(img, max_layer=max_layer)
+    pyramid = skimage.transform.pyramid_gaussian(img, max_layer=max_layer, multichannel=False)
     for layer, layer_img in enumerate(pyramid):
         for yi, xi, tile_img in tile(layer_img, n):
             with warnings.catch_warnings():
@@ -67,14 +67,15 @@ def transform_xml(metadata, id_map):
 def is_faas_pyramid(image_reader):
     """Return True if this is an OME-TIFF containing a 'Faas' pyramid."""
     format_reader = image_reader.getReader()
-    if format_reader.format == 'OME-TIFF':
+    format_reader = jnius.cast(IFormatHandler, format_reader)
+    if format_reader.getFormat() == 'OME-TIFF':
         # This cast does something to the internals of OMETiffReader that seems
         # to be required to make the getClass call on the next line work. It
         # looks like a bug in jnius.
-        format_reader = jnius.cast(OMETiffReader, format_reader)
+        ome_tiff_reader = jnius.cast(ImageReader, format_reader).getReader()
         # Peek at the protected 'info' field through reflection.
-        field_info = OMETiffReader.getClass().getDeclaredField(JString('info'))
-        info = field_info.get(format_reader)
+        field_info = ome_tiff_reader.getClass().getDeclaredField(JString('info'))
+        info = field_info.get(ome_tiff_reader)
         tiff_reader = jnius.cast(MinimalTiffReader, info[0][0].reader)
         ifd = tiff_reader.getIFDs().get(0)
         software = ifd.getIFDStringValue(IFD.SOFTWARE)
@@ -100,6 +101,7 @@ jnius.reflect.Field.get = jnius.reflect.JavaMethod(
 JString = jnius.autoclass('java.lang.String')
 DebugTools = jnius.autoclass('loci.common.DebugTools')
 IFormatReader = jnius.autoclass('loci.formats.IFormatReader')
+IFormatHandler = jnius.autoclass('loci.formats.IFormatHandler')
 MetadataStore = jnius.autoclass('loci.formats.meta.MetadataStore')
 ServiceFactory = jnius.autoclass('loci.common.services.ServiceFactory')
 OMEXMLService = jnius.autoclass('loci.formats.services.OMEXMLService')
@@ -109,6 +111,7 @@ ClassList = jnius.autoclass('loci.formats.ClassList')
 OMETiffReader = jnius.autoclass('loci.formats.in.OMETiffReader')
 MinimalTiffReader = jnius.autoclass('loci.formats.in.MinimalTiffReader')
 IFD = jnius.autoclass('loci.formats.tiff.IFD')
+OMEXMLMetadataImpl = jnius.autoclass('loci.formats.ome.OMEXMLMetadataImpl')
 
 DebugTools.enableLogging(JString("ERROR"))
 
@@ -165,6 +168,9 @@ supported_dtypes = {
     'uint8': np.uint8,
     'uint16': np.uint16,
 }
+
+# Must cast as implementation class, otherwise pyjnius does not see method getPixelsType 
+metadata = jnius.cast(OMEXMLMetadataImpl, metadata)
 ome_pixel_type = metadata.getPixelsType(0).value
 try:
     dtype = supported_dtypes[ome_pixel_type]
@@ -235,7 +241,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                         'ignore', r'.* is a low contrast image', UserWarning,
                         '^skimage\.io'
                     )
-                    skimage.io.imsave(buf, tile_img, format_str=tile_ext)
+                    skimage.io.imsave(buf, tile_img, format=tile_ext)
                 buf.seek(0)
 
                 tile_key = str(pathlib.Path(img_id) / filename)
