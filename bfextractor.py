@@ -14,10 +14,14 @@ import numpy as np
 import skimage.io
 import skimage.transform
 import jnius
+import logging, time
+import blosc
 
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s - %(message)s')
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 OME_NS = 'http://www.openmicroscopy.org/Schemas/OME/2016-06'
-
 
 def tile(img, n):
     for yi, y in enumerate(range(0, img.shape[0], n)):
@@ -179,8 +183,8 @@ except KeyError as e:
     raise RuntimeError(msg) from None
 
 # FIXME Consider other file types to support higher-depth pixel formats.
-tile_ext = 'png'
-tile_content_type = 'image/png'
+tile_ext = 'zstd.blosc'
+tile_content_type = 'application/x-binary'
 series_count = reader.getSeriesCount()
 # Ignore subresolutions in Faas pyramids.
 if is_faas_pyramid(reader):
@@ -219,7 +223,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
         max_level = 0
 
         for c, z, t in itertools.product(rc, rz, rt):
-
+            start = time.time()
             index = reader.getIndex(z, c, t)
             byte_array = reader.openBytes(index)
             # FIXME BioFormats seems to return the same size for all series,
@@ -230,18 +234,20 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
             img = img.reshape(shape)
 
             for level, ty, tx, tile_img in build_pyramid(img, TILE_SIZE):
+                logger.info(f'Tile C={c} level={level} x={tx} y={ty}')
 
                 if level > max_level:
                     max_level = level
 
                 filename = f'C{c}-T{t}-Z{z}-L{level}-Y{ty}-X{tx}.{tile_ext}'
-                buf = io.BytesIO()
+
                 with warnings.catch_warnings():
                     warnings.filterwarnings(
                         'ignore', r'.* is a low contrast image', UserWarning,
                         '^skimage\.io'
                     )
-                    skimage.io.imsave(buf, tile_img, format=tile_ext)
+                    buf = io.BytesIO(blosc.pack_array(tile_img, clevel=3, cname="zstd"))
+
                 buf.seek(0)
 
                 tile_key = str(pathlib.Path(img_id) / filename)
@@ -251,6 +257,10 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                     buf, bucket, tile_key, extra_args=upload_args
                 )
                 upload_futures.append(future)
+
+            end = round((time.time() - start) * 1000)
+            logger.info(f'Channel {c} processed in {end} ms')
+
 
         # Add this new image to the list to be attached to this Fileset
         images.append({
