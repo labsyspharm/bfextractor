@@ -87,6 +87,16 @@ def is_faas_pyramid(image_reader):
             return True
     return False
 
+def update_fileset_progress(progress):
+    logger.info(f'Progress: {progress}')
+    if not debug:
+        lmb.invoke(
+            FunctionName=set_fileset_complete_arn,
+            Payload=str.encode(json.dumps({
+                'fileset_uuid': str(fileset_uuid),
+                'progress': progress
+            }))
+        )
 
 class ProgressSubscriber(s3transfer.subscribers.BaseSubscriber):
 
@@ -201,12 +211,22 @@ def mk_name(file_path, n):
         suffix = ''
     return stem[:IMAGE_NAME_LENGTH - len(suffix)] + suffix
 
+def count_processed(reader, series_count):
+    to_process = 0
+    for series in range(series_count):
+        reader.setSeries(series)
+        to_process += reader.sizeC * reader.sizeZ * reader.sizeT
+
+    return to_process
+
 
 with s3transfer.manager.TransferManager(s3) as transfer_manager:
 
     upload_futures = []
     image_id_map = {}
     images = []
+    processed = 0
+    to_process = count_processed(reader, series_count)
 
     for series in range(series_count):
 
@@ -260,6 +280,9 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
 
             end = round((time.time() - start) * 1000)
             logger.info(f'Channel {c} processed in {end} ms')
+            processed += 1
+            progress = round(processed / to_process * 100)
+            update_fileset_progress(progress)
 
 
         # Add this new image to the list to be attached to this Fileset
@@ -292,6 +315,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
             FunctionName=set_fileset_complete_arn,
             Payload=str.encode(json.dumps({
                 'fileset_uuid': str(fileset_uuid),
-                'images': images
+                'images': images,
+                'complete': 'True'
             }))
         )
