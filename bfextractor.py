@@ -1,3 +1,4 @@
+import pickle
 import warnings
 import sys
 import os
@@ -266,7 +267,8 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                         'ignore', r'.* is a low contrast image', UserWarning,
                         '^skimage\.io'
                     )
-                    buf = io.BytesIO(blosc.pack_array(tile_img, clevel=3, cname="zstd"))
+                    pickled_array = pickle.dumps(tile_img, pickle.DEFAULT_PROTOCOL)
+                    buf = io.BytesIO(blosc.compress(pickled_array, tile_img.itemsize, clevel=1, shuffle=blosc.BITSHUFFLE, cname="zstd"))
 
                 buf.seek(0)
 
