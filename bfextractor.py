@@ -16,7 +16,6 @@ import skimage.io
 import skimage.transform
 import jnius
 import logging, time
-import blosc
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s - %(message)s')
 logger = logging.getLogger()
@@ -194,8 +193,8 @@ except KeyError as e:
     raise RuntimeError(msg) from None
 
 # FIXME Consider other file types to support higher-depth pixel formats.
-tile_ext = 'zstd.blosc'
-tile_content_type = 'application/x-binary'
+tile_ext = 'png'
+tile_content_type = 'image/png'
 series_count = reader.getSeriesCount()
 # Ignore subresolutions in Faas pyramids.
 if is_faas_pyramid(reader):
@@ -261,14 +260,13 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                     max_level = level
 
                 filename = f'C{c}-T{t}-Z{z}-L{level}-Y{ty}-X{tx}.{tile_ext}'
-
+                buf = io.BytesIO()
                 with warnings.catch_warnings():
                     warnings.filterwarnings(
                         'ignore', r'.* is a low contrast image', UserWarning,
                         '^skimage\.io'
                     )
-                    pickled_array = pickle.dumps(tile_img, pickle.DEFAULT_PROTOCOL)
-                    buf = io.BytesIO(blosc.compress(pickled_array, tile_img.itemsize, clevel=1, shuffle=blosc.BITSHUFFLE, cname="zstd"))
+                    skimage.io.imsave(buf, tile_img, format=tile_ext)
 
                 buf.seek(0)
 
