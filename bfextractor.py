@@ -266,7 +266,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                         'ignore', r'.* is a low contrast image', UserWarning,
                         '^skimage\.io'
                     )
-                    skimage.io.imsave(buf, tile_img, format=tile_ext)
+                    skimage.io.imsave(buf, tile_img, format=tile_ext, compress_level=1)
 
                 buf.seek(0)
 
