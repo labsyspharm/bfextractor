@@ -16,6 +16,7 @@ import skimage.io
 import skimage.transform
 import jnius
 import logging, time
+import tifffile
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s - %(message)s')
 logger = logging.getLogger()
@@ -193,8 +194,10 @@ except KeyError as e:
     raise RuntimeError(msg) from None
 
 # FIXME Consider other file types to support higher-depth pixel formats.
-tile_ext = 'png'
-tile_content_type = 'image/png'
+tile_ext = 'tif'
+tile_content_type = 'image/tiff'
+image_format = 'tiff'
+image_compression = 'zstd'
 series_count = reader.getSeriesCount()
 # Ignore subresolutions in Faas pyramids.
 if is_faas_pyramid(reader):
@@ -266,9 +269,10 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                         'ignore', r'.* is a low contrast image', UserWarning,
                         '^skimage\.io'
                     )
-                    skimage.io.imsave(buf, tile_img, format=tile_ext, compress_level=1)
+                    tifffile.imwrite(buf, tile_img, compress=("ZSTD",1))
 
                 buf.seek(0)
+                print(str(len(buf.getvalue())))
 
                 tile_key = str(pathlib.Path(img_id) / filename)
                 upload_args = dict(ContentType=tile_content_type)
@@ -289,7 +293,10 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
         images.append({
             'uuid': img_id,
             'name': mk_name(file_path, series),
-            'pyramid_levels': max_level + 1
+            'pyramid_levels': max_level + 1,
+            'format': image_format,
+            'compression': image_compression,
+            'tile_size': TILE_SIZE
         })
 
     xml_key = str(fileset_uuid / 'metadata.xml')
