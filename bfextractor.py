@@ -16,10 +16,13 @@ import skimage.io
 import skimage.transform
 import jnius
 import logging, time
+import tiledb
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s - %(message)s')
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+print("Using tiledb ", tiledb.__version__)
 
 OME_NS = 'http://www.openmicroscopy.org/Schemas/OME/2016-06'
 
@@ -253,11 +256,29 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
             img = np.frombuffer(byte_array.tostring(), dtype=dtype)
             img = img.reshape(shape)
 
+            dim_c = tiledb.Dim(name="c", domain=(0, reader.sizeC), tile=1, dtype=np.uint16)
+            dim_t = tiledb.Dim(name="t", domain=(0, reader.sizeT), tile=1, dtype=np.uint16)
+            dim_z = tiledb.Dim(name="z", domain=(0, reader.sizeZ), tile=1, dtype=np.uint16)
+            dim_y = tiledb.Dim(name="y", domain=(0, 1023), tile=1024, dtype=np.uint16)
+            dim_x = tiledb.Dim(name="x", domain=(0, 1023), tile=1024, dtype=np.uint16)
+            attr = tiledb.Attr(name="attr", dtype=np.uint16,
+                               filters=tiledb.FilterList([tiledb.LZ4Filter()]))
+            domain = tiledb.Domain(dim_c, dim_t, dim_z, dim_y, dim_x)
+            schema = tiledb.ArraySchema(domain=domain, sparse=False, attrs=[attr])
+
+            array_uri = "s3://" + bucket + "/" + img_id + "/" + "L" + str(max_level)
+            tiledb.DenseArray.create(array_uri, schema)
+
             for level, ty, tx, tile_img in build_pyramid(img, TILE_SIZE):
                 logger.info(f'Tile C={c} level={level} x={tx} y={ty}')
 
+                with tiledb.DenseArray(array_uri, 'w') as A:
+                    A[c, t, z, :, :] = tile_img
+
                 if level > max_level:
                     max_level = level
+                    array_uri = "s3://" + bucket + "/" + img_id + "/" + "L" + str(max_level)
+                    tiledb.DenseArray.create(array_uri, schema)
 
                 filename = f'C{c}-T{t}-Z{z}-L{level}-Y{ty}-X{tx}.{tile_ext}'
                 buf = io.BytesIO()
