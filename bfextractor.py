@@ -1,4 +1,3 @@
-import pickle
 import warnings
 import sys
 import os
@@ -31,6 +30,11 @@ def tile(img, n):
 
 
 def build_pyramid(img, n):
+    # Convert to float32 because otherwise pyramid_gaussian will convert image to float64
+    # which reserves excessive memory
+    original_dtype = img.dtype
+    img = skimage.img_as_float32(img, False)
+
     max_layer = max(max(np.ceil(np.log2(np.array(img.shape) / n))), 0)
     pyramid = skimage.transform.pyramid_gaussian(img, max_layer=max_layer, multichannel=False)
     for layer, layer_img in enumerate(pyramid):
@@ -40,7 +44,7 @@ def build_pyramid(img, n):
                     'ignore', r'Possible precision loss', UserWarning,
                     '^skimage\.util\.dtype'
                 )
-                tile_img = skimage.util.dtype.convert(tile_img, img.dtype)
+                tile_img = skimage.util.dtype.convert(tile_img, original_dtype)
             yield layer, yi, xi, tile_img
 
 
@@ -223,7 +227,8 @@ def count_processed(reader, series_count):
     return to_process
 
 
-with s3transfer.manager.TransferManager(s3) as transfer_manager:
+transfer_config = s3transfer.manager.TransferConfig(max_request_queue_size=15, max_submission_queue_size=15)
+with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_manager:
 
     upload_futures = []
     image_id_map = {}
@@ -272,7 +277,6 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                     tifffile.imwrite(buf, tile_img, compress=("ZSTD",1))
 
                 buf.seek(0)
-                print(str(len(buf.getvalue())))
 
                 tile_key = str(pathlib.Path(img_id) / filename)
                 upload_args = dict(ContentType=tile_content_type)
@@ -281,6 +285,7 @@ with s3transfer.manager.TransferManager(s3) as transfer_manager:
                     buf, bucket, tile_key, extra_args=upload_args
                 )
                 upload_futures.append(future)
+
 
             end = round((time.time() - start) * 1000)
             logger.info(f'Channel {c} processed in {end} ms')
