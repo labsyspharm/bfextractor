@@ -1,3 +1,4 @@
+import math
 import warnings
 import sys
 import os
@@ -226,6 +227,49 @@ def count_processed(reader, series_count):
 
     return to_process
 
+def read_image_in_chunks(reader, index, dtype):
+    """
+    Read image in chunks of rows.
+    Large images can have more pixels than Java's array length limit (2^31 − 1)
+    Numpy does not have any array limit so it's ok to construct a large numpy array
+    and set the values in chunks read from Java.
+    """
+    JAVA_MAX_ARRAY_SIZE = 2147483639
+    num_bytes = reader.sizeY * reader.sizeX * np.dtype(dtype).itemsize
+    if num_bytes < JAVA_MAX_ARRAY_SIZE:
+        # Image total bytes is under Java's array lenght limit
+        # We can just read the whole image at once
+        byte_array = reader.openBytes(index)
+        shape = (reader.sizeY, reader.sizeX)
+        img = np.frombuffer(byte_array.tostring(), dtype=dtype)
+        img = img.reshape(shape)
+        return img
+
+    print("Using chunked reading, image bytes: ", num_bytes)
+    CHUNK_WIDTH = reader.sizeX
+    CHUNK_HEIGHT = 1000
+    img = np.zeros((reader.sizeY, reader.sizeX), dtype)
+    chunks_y = math.ceil(reader.sizeY / CHUNK_HEIGHT)
+    chunks_x = math.ceil(reader.sizeX / CHUNK_WIDTH)
+    for chunk_x in range(chunks_x):
+        for chunk_y in range(chunks_y):
+            width = CHUNK_WIDTH
+            height = CHUNK_HEIGHT
+            if chunk_x == chunks_x - 1:
+                width = reader.sizeX - (CHUNK_WIDTH * chunk_x)
+            if chunk_y == chunks_y - 1:
+                height = reader.sizeY - (CHUNK_HEIGHT * chunk_y)
+
+            x = chunk_x * CHUNK_WIDTH
+            y = chunk_y * CHUNK_HEIGHT
+            print("Reading bytes from {}:{},{}:{}".format(x, x + width, y, y + height))
+            chunk = reader.openBytes(index, x, y, width, height)
+            chunk_arr = np.frombuffer(chunk.tostring(), dtype=dtype)
+            chunk_arr = chunk_arr.reshape((height, width))
+            img[y:y + height, x:x + width] = chunk_arr
+
+    return img
+
 
 transfer_config = s3transfer.manager.TransferConfig(max_request_queue_size=15, max_submission_queue_size=15)
 with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_manager:
@@ -251,15 +295,12 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
         max_level = 0
 
         for c, z, t in itertools.product(rc, rz, rt):
-            start = time.time()
-            index = reader.getIndex(z, c, t)
-            byte_array = reader.openBytes(index)
             # FIXME BioFormats seems to return the same size for all series,
             # at least for Metamorph datasets with one different-sized image.
             # Is this a broad BioFormats issue or just that reader?
-            shape = (reader.sizeY, reader.sizeX)
-            img = np.frombuffer(byte_array.tostring(), dtype=dtype)
-            img = img.reshape(shape)
+            start = time.time()
+            index = reader.getIndex(z, c, t)
+            img = read_image_in_chunks(reader, index, dtype)
 
             for level, ty, tx, tile_img in build_pyramid(img, TILE_SIZE):
                 logger.info(f'Tile C={c} level={level} x={tx} y={ty}')
