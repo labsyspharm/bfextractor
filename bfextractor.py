@@ -17,6 +17,7 @@ import skimage.transform
 import jnius
 import logging, time
 import tifffile
+import gc
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s - %(message)s')
 logger = logging.getLogger()
@@ -271,10 +272,9 @@ def read_image_in_chunks(reader, index, dtype):
     return img
 
 
-transfer_config = s3transfer.manager.TransferConfig(max_request_queue_size=15, max_submission_queue_size=15)
+transfer_config = s3transfer.manager.TransferConfig()
 with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_manager:
 
-    upload_futures = []
     image_id_map = {}
     images = []
     processed = 0
@@ -298,6 +298,7 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
             # FIXME BioFormats seems to return the same size for all series,
             # at least for Metamorph datasets with one different-sized image.
             # Is this a broad BioFormats issue or just that reader?
+            upload_futures = []
             start = time.time()
             index = reader.getIndex(z, c, t)
             img = read_image_in_chunks(reader, index, dtype)
@@ -327,6 +328,14 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
                 )
                 upload_futures.append(future)
 
+            # Wait for the channel to upload before continuing, to free up some memory
+            print(f'Waiting for channel {c} upload to finish...')
+            for future in upload_futures:
+                future.result()
+
+            upload_futures.clear()
+            del upload_futures
+            gc.collect()
 
             end = round((time.time() - start) * 1000)
             logger.info(f'Channel {c} processed in {end} ms')
@@ -352,10 +361,7 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
     future = transfer_manager.upload(
         xml_buf, bucket, xml_key, extra_args=upload_args
     )
-    upload_futures.append(future)
-
-    for future in upload_futures:
-        future.result()
+    future.result()
 
     print('Completing Fileset {} and registering images: {}'.format(
         fileset_uuid,
