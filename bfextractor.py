@@ -272,13 +272,14 @@ def read_image_in_chunks(reader, index, dtype):
     return img
 
 
-transfer_config = s3transfer.manager.TransferConfig()
+transfer_config = s3transfer.manager.TransferConfig(max_request_queue_size=100, max_submission_queue_size=100)
 with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_manager:
 
     image_id_map = {}
     images = []
     processed = 0
     to_process = count_processed(reader, series_count)
+    upload_args = dict(ContentType=tile_content_type)
 
     for series in range(series_count):
 
@@ -320,21 +321,18 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
 
                 buf.seek(0)
 
-                tile_key = str(pathlib.Path(img_id) / filename)
-                upload_args = dict(ContentType=tile_content_type)
-
+                tile_key = f'{img_id}/{filename}'
                 future = transfer_manager.upload(
                     buf, bucket, tile_key, extra_args=upload_args
                 )
                 upload_futures.append(future)
 
-            # Wait for the channel to upload before continuing, to free up some memory
-            print(f'Waiting for channel {c} upload to finish...')
-            for future in upload_futures:
-                future.result()
+            # Clear all finished uploads, to free up some memory
+            finished = [f for f in upload_futures if future.done()]
+            for future in finished:
+                upload_futures.remove(future)
+                del future
 
-            upload_futures.clear()
-            del upload_futures
             gc.collect()
 
             end = round((time.time() - start) * 1000)
@@ -361,7 +359,9 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
     future = transfer_manager.upload(
         xml_buf, bucket, xml_key, extra_args=upload_args
     )
-    future.result()
+    upload_futures.append(future)
+    for future in upload_futures:
+        future.result()
 
     print('Completing Fileset {} and registering images: {}'.format(
         fileset_uuid,
