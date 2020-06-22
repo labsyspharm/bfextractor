@@ -49,6 +49,20 @@ def build_pyramid(img, n):
                 tile_img = skimage.util.dtype.convert(tile_img, original_dtype)
             yield layer, yi, xi, tile_img
 
+def get_pyramid(index, tile_size, dtype, faas_pyramid=False):
+    max_layer = reader.getResolutionCount() if not faas_pyramid else reader.getSeriesCount()
+    for layer in range(max_layer):
+        if not faas_pyramid:
+            reader.setResolution(layer)
+        else:
+            reader.setSeries(layer)
+
+        layer_img = read_image_in_chunks(reader, index, dtype)
+
+        for yi, xi, tile_img in tile(layer_img, tile_size):
+            tile_img = skimage.util.dtype.convert(tile_img, dtype)
+            yield layer, yi, xi, tile_img
+
 
 def transform_xml(metadata, id_map):
     ElementTree.register_namespace('', OME_NS)
@@ -204,12 +218,18 @@ tile_ext = 'tif'
 tile_content_type = 'image/tiff'
 image_format = 'tiff'
 image_compression = 'zstd'
+contains_pyramid = reader.getResolutionCount() > 1
 series_count = reader.getSeriesCount()
-# Ignore subresolutions in Faas pyramids.
-if is_faas_pyramid(reader):
-    series_count = 1
-series_digits = len(str(series_count))
+faas_pyramid = False
 
+if is_faas_pyramid(reader):
+    # Don't treat subresolutions as separate images in Faas pyramids.
+    series_count = 1
+    contains_pyramid = True
+    faas_pyramid = True
+
+series_digits = len(str(series_count))
+print("Image contains pyramid: ", contains_pyramid)
 
 def mk_name(file_path, n):
     stem = file_path.stem
@@ -238,7 +258,7 @@ def read_image_in_chunks(reader, index, dtype):
     JAVA_MAX_ARRAY_SIZE = 2147483639
     num_bytes = reader.sizeY * reader.sizeX * np.dtype(dtype).itemsize
     if num_bytes < JAVA_MAX_ARRAY_SIZE:
-        # Image total bytes is under Java's array lenght limit
+        # Image total bytes is under Java's array length limit
         # We can just read the whole image at once
         byte_array = reader.openBytes(index)
         shape = (reader.sizeY, reader.sizeX)
@@ -272,7 +292,30 @@ def read_image_in_chunks(reader, index, dtype):
     return img
 
 
-transfer_config = s3transfer.manager.TransferConfig(max_request_queue_size=100, max_submission_queue_size=100)
+transfer_config = s3transfer.manager.TransferConfig(max_request_queue_size=500, max_submission_queue_size=500)
+
+
+def handle_tile(c, z, t, level, ty, tx, tile_img, upload_futures):
+    global filename, future
+    logger.info(f'Tile C={c} level={level} x={tx} y={ty}')
+    filename = f'C{c}-T{t}-Z{z}-L{level}-Y{ty}-X{tx}.{tile_ext}'
+    buf = io.BytesIO()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore', r'.* is a low contrast image', UserWarning,
+            '^skimage\.io'
+        )
+        tifffile.imwrite(buf, tile_img, compress=("ZSTD", 1))
+    buf.seek(0)
+    tile_key = f'{img_id}/{filename}'
+    future = transfer_manager.upload(
+        buf, bucket, tile_key, extra_args=upload_args
+    )
+    upload_futures.append(future)
+
+def get_max_level(faas_pyramid=False):
+    return reader.getResolutionCount() if not faas_pyramid else reader.getSeriesCount()
+
 with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_manager:
 
     image_id_map = {}
@@ -293,7 +336,7 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
         print(f'Allocated ID for series {series}: {img_id}')
 
         # TODO Better way to get number of levels
-        max_level = 0
+        max_level = get_max_level(faas_pyramid)
 
         for c, z, t in itertools.product(rc, rz, rt):
             # FIXME BioFormats seems to return the same size for all series,
@@ -302,30 +345,15 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
             upload_futures = []
             start = time.time()
             index = reader.getIndex(z, c, t)
-            img = read_image_in_chunks(reader, index, dtype)
 
-            for level, ty, tx, tile_img in build_pyramid(img, TILE_SIZE):
-                logger.info(f'Tile C={c} level={level} x={tx} y={ty}')
-
-                if level > max_level:
-                    max_level = level
-
-                filename = f'C{c}-T{t}-Z{z}-L{level}-Y{ty}-X{tx}.{tile_ext}'
-                buf = io.BytesIO()
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        'ignore', r'.* is a low contrast image', UserWarning,
-                        '^skimage\.io'
-                    )
-                    tifffile.imwrite(buf, tile_img, compress=("ZSTD",1))
-
-                buf.seek(0)
-
-                tile_key = f'{img_id}/{filename}'
-                future = transfer_manager.upload(
-                    buf, bucket, tile_key, extra_args=upload_args
-                )
-                upload_futures.append(future)
+            if not contains_pyramid:
+                img = read_image_in_chunks(reader, index, dtype)
+                for level, ty, tx, tile_img in build_pyramid(img, TILE_SIZE):
+                    handle_tile(c, z, t, level, ty, tx, tile_img, upload_futures)
+                    max_level = max(level, max_level)
+            else:
+                for level, ty, tx, tile_img in get_pyramid(index, TILE_SIZE, dtype, faas_pyramid=faas_pyramid):
+                    handle_tile(c, z, t, level, ty, tx, tile_img, upload_futures)
 
             # Clear all finished uploads, to free up some memory
             finished = [f for f in upload_futures if future.done()]
