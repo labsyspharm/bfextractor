@@ -202,6 +202,7 @@ reader.setId(JString(str(file_path)))
 supported_dtypes = {
     'uint8': np.uint8,
     'uint16': np.uint16,
+    'uint32': np.uint32
 }
 
 # Must cast as implementation class, otherwise pyjnius does not see method getPixelsType 
