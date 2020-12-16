@@ -9,6 +9,7 @@ import uuid
 import json
 from xml.etree import ElementTree
 import boto3
+import s3fs
 import s3transfer.manager
 import s3transfer.subscribers
 import numpy as np
@@ -18,29 +19,29 @@ import jnius
 import logging, time
 import tifffile
 import gc
+import zarr
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s - %(message)s')
-logger = logging.getLogger()
+logger = logging.getLogger("minerva")
 logger.setLevel(logging.INFO)
 
 OME_NS = 'http://www.openmicroscopy.org/Schemas/OME/2016-06'
 
-def tile(img, n):
-    for yi, y in enumerate(range(0, img.shape[0], n)):
-        for xi, x in enumerate(range(0, img.shape[1], n)):
-            yield yi, xi, img[y:y+n, x:x+n]
+def tile(img, tile_size):
+    for yi, y in enumerate(range(0, img.shape[0], tile_size)):
+        for xi, x in enumerate(range(0, img.shape[1], tile_size)):
+            yield yi, xi, img[y:y+tile_size, x:x+tile_size]
 
-
-def build_pyramid(img, n):
+def build_pyramid(img, tile_size):
     # Convert to float32 because otherwise pyramid_gaussian will convert image to float64
     # which reserves excessive memory
     original_dtype = img.dtype
     img = skimage.img_as_float32(img, False)
 
-    max_layer = max(max(np.ceil(np.log2(np.array(img.shape) / n))), 0)
+    max_layer = max(max(np.ceil(np.log2(np.array(img.shape) / tile_size))), 0)
     pyramid = skimage.transform.pyramid_gaussian(img, max_layer=max_layer, multichannel=False)
     for layer, layer_img in enumerate(pyramid):
-        for yi, xi, tile_img in tile(layer_img, n):
+        for yi, xi, tile_img in tile(layer_img, tile_size):
             with warnings.catch_warnings():
                 warnings.filterwarnings(
                     'ignore', r'Possible precision loss', UserWarning,
@@ -62,6 +63,49 @@ def get_pyramid(index, tile_size, dtype, faas_pyramid=False):
         for yi, xi, tile_img in tile(layer_img, tile_size):
             tile_img = skimage.util.dtype.convert(tile_img, dtype)
             yield layer, yi, xi, tile_img
+
+def build_pyramid_levels(img, tile_size):
+    # Convert to float32 because otherwise pyramid_gaussian will convert image to float64
+    # which reserves excessive memory
+    original_dtype = img.dtype
+    img = skimage.img_as_float32(img, False)
+
+    max_layer = max(max(np.ceil(np.log2(np.array(img.shape) / tile_size))), 0)
+    pyramid = skimage.transform.pyramid_gaussian(img, max_layer=max_layer, multichannel=False)
+    for layer, layer_img in enumerate(pyramid):
+        layer_img = skimage.util.dtype.convert(layer_img, original_dtype)
+        yield layer_img
+
+def set_reader_pyramid_level(level, faas_pyramid=False):
+    if not faas_pyramid:
+        reader.setResolution(level)
+    else:
+        reader.setSeries(level)
+
+def get_builtin_pyramid_level_data(index, level, dtype, faas_pyramid=False):
+    set_reader_pyramid_level(level, faas_pyramid)
+    layer_img = read_image_in_chunks(reader, index, dtype)
+    return layer_img
+
+def get_generated_pyramid_level_data(index, dtype, faas_pyramid=False, pyramid_levels=None):
+    layer_img = read_image_in_chunks(reader, index, dtype)
+    if pyramid_levels is None:
+        logger.info("Building pyramid levels")
+        pyramid_levels = []
+        for level in build_pyramid(layer_img, TILE_SIZE):
+            pyramid_levels.append(level)
+
+    return pyramid_levels
+
+def builtin_pyramids(index, dtype, max_levels, faas_pyramid=False):
+    for level in range(max_levels):
+        set_reader_pyramid_level(level, faas_pyramid)
+
+        layer_img = read_image_in_chunks(reader, index, dtype)
+        yield layer_img
+
+def get_tile(pyramid_img, xi, yi, tile_size):
+    return pyramid_img[yi*tile_size:(yi+1)*tile_size, xi*tile_size:(xi+1)*tile_size]
 
 
 def transform_xml(metadata, id_map):
@@ -208,16 +252,19 @@ supported_dtypes = {
 # Must cast as implementation class, otherwise pyjnius does not see method getPixelsType 
 metadata = jnius.cast(OMEXMLMetadataImpl, metadata)
 ome_pixel_type = metadata.getPixelsType(0).value
+logger.info("Pixel Type: %s", ome_pixel_type)
 try:
-    dtype = supported_dtypes[ome_pixel_type]
+    dtype = np.dtype(supported_dtypes[ome_pixel_type])
 except KeyError as e:
     msg = f"Pixel type '{ome_pixel_type}' is not supported"
     raise RuntimeError(msg) from None
 
+dtype = dtype.newbyteorder("<" if reader.isLittleEndian() else ">")
+
 # FIXME Consider other file types to support higher-depth pixel formats.
 tile_ext = 'tif'
-tile_content_type = 'image/tiff'
-image_format = 'tiff'
+tile_content_type = 'image/zarr'
+image_format = 'zarr'
 image_compression = 'zstd'
 contains_pyramid = reader.getResolutionCount() > 1
 series_count = reader.getSeriesCount()
@@ -230,7 +277,7 @@ if is_faas_pyramid(reader):
     faas_pyramid = True
 
 series_digits = len(str(series_count))
-print("Image contains pyramid: ", contains_pyramid)
+logger.info("Image contains pyramid: %s", contains_pyramid)
 
 def mk_name(file_path, n):
     stem = file_path.stem
@@ -245,8 +292,17 @@ def count_processed(reader, series_count):
     to_process = 0
     for series in range(series_count):
         reader.setSeries(series)
-        to_process += reader.sizeC * reader.sizeZ * reader.sizeT
+        width = reader.sizeX
+        height = reader.sizeY
 
+        while (width >= TILE_SIZE) and (height >= TILE_SIZE):
+            num_tiles = math.ceil(width / TILE_SIZE) * math.ceil(height / TILE_SIZE)
+            to_process += reader.sizeC * reader.sizeZ * reader.sizeT * num_tiles
+            width = width // 2
+            height = height // 2
+
+        num_tiles = math.ceil(width / TILE_SIZE) * math.ceil(height / TILE_SIZE)
+        to_process += reader.sizeC * reader.sizeZ * reader.sizeT * num_tiles
     return to_process
 
 def read_image_in_chunks(reader, index, dtype):
@@ -267,7 +323,7 @@ def read_image_in_chunks(reader, index, dtype):
         img = img.reshape(shape)
         return img
 
-    print("Using chunked reading, image bytes: ", num_bytes)
+    logger.info("Using chunked reading, image bytes: %s", num_bytes)
     CHUNK_WIDTH = reader.sizeX
     CHUNK_HEIGHT = 1000
     img = np.zeros((reader.sizeY, reader.sizeX), dtype)
@@ -284,7 +340,7 @@ def read_image_in_chunks(reader, index, dtype):
 
             x = chunk_x * CHUNK_WIDTH
             y = chunk_y * CHUNK_HEIGHT
-            print("Reading bytes from {}:{},{}:{}".format(x, x + width, y, y + height))
+            logger.debug("Reading bytes from {}:{},{}:{}".format(x, x + width, y, y + height))
             chunk = reader.openBytes(index, x, y, width, height)
             chunk_arr = np.frombuffer(chunk.tostring(), dtype=dtype)
             chunk_arr = chunk_arr.reshape((height, width))
@@ -317,58 +373,69 @@ def handle_tile(c, z, t, level, ty, tx, tile_img, upload_futures):
 def get_max_level(faas_pyramid=False):
     return reader.getResolutionCount() if not faas_pyramid else reader.getSeriesCount()
 
-with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_manager:
 
+with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_manager:
     image_id_map = {}
     images = []
     processed = 0
     to_process = count_processed(reader, series_count)
+    logger.info("Tiles to process %s", to_process)
+    is_rgb = reader.isRGB()
+    logger.info("RGB: %s", is_rgb)
     upload_args = dict(ContentType=tile_content_type)
 
-    for series in range(series_count):
+    s3 = s3fs.S3FileSystem(anon=False, client_kwargs=dict(region_name="us-east-1"))
+    compressor = zarr.Blosc(cname='zstd', clevel=3)
 
+    for series in range(series_count):
         reader.setSeries(series)
         rc = range(reader.sizeC)
         rz = range(reader.sizeZ)
         rt = range(reader.sizeT)
+        width = reader.sizeX
+        height = reader.sizeY
         img_id = str(uuid.uuid4())
         old_xml_id = metadata.getImageID(series)
         image_id_map[old_xml_id] = f'Image:{img_id}'
-        print(f'Allocated ID for series {series}: {img_id}')
+        logger.info(f'Allocated ID for series {series}: {img_id}')
 
-        # TODO Better way to get number of levels
+        s3_store = s3fs.S3Map(root=f"{bucket}/{img_id}", s3=s3, check=False)
+        output = zarr.group(store=s3_store, overwrite=True)
+
         max_level = get_max_level(faas_pyramid)
 
-        for c, z, t in itertools.product(rc, rz, rt):
-            # FIXME BioFormats seems to return the same size for all series,
-            # at least for Metamorph datasets with one different-sized image.
-            # Is this a broad BioFormats issue or just that reader?
-            upload_futures = []
-            start = time.time()
-            index = reader.getIndex(z, c, t)
+        for level in range(max_level):
+            set_reader_pyramid_level(level, faas_pyramid)
+            arr = output.create(shape=(reader.sizeT, reader.sizeC, reader.sizeZ, reader.sizeY, reader.sizeX),
+                                chunks=(1, 1, 1, TILE_SIZE, TILE_SIZE),
+                                name=str(level), dtype=dtype, compressor=compressor)
+            logger.info("Created zarr array %s", arr.shape)
+            for c, z, t in itertools.product(rc, rz, rt):
+                start = time.time()
+                logger.info("Reading Level=%s T=%s C=%s Z=%s", level, t, c, z)
+                index = reader.getIndex(z, c, t)
+                level_img = get_builtin_pyramid_level_data(index, level, dtype, faas_pyramid=faas_pyramid)
 
-            if not contains_pyramid:
-                img = read_image_in_chunks(reader, index, dtype)
-                for level, ty, tx, tile_img in build_pyramid(img, TILE_SIZE):
-                    handle_tile(c, z, t, level, ty, tx, tile_img, upload_futures)
-                    max_level = max(level, max_level)
-            else:
-                for level, ty, tx, tile_img in get_pyramid(index, TILE_SIZE, dtype, faas_pyramid=faas_pyramid):
-                    handle_tile(c, z, t, level, ty, tx, tile_img, upload_futures)
+                logger.info("Level shape=%s", level_img.shape)
 
-            # Clear all finished uploads, to free up some memory
-            finished = [f for f in upload_futures if future.done()]
-            for future in finished:
-                upload_futures.remove(future)
-                del future
+                tiles_height = math.ceil(level_img.shape[0] / TILE_SIZE)
+                tiles_width = math.ceil(level_img.shape[1] / TILE_SIZE)
+                for yi in range(tiles_height):
+                    for xi in range(tiles_width):
+                        tile = get_tile(level_img, xi, yi, TILE_SIZE)
+                        logger.info("Tile X=%s Y=%s shape=%s", xi, yi, tile.shape)
 
-            gc.collect()
+                        arr[t, c, z,
+                            yi*TILE_SIZE:yi*TILE_SIZE+tile.shape[0],
+                            xi*TILE_SIZE:xi*TILE_SIZE+tile.shape[1]] = tile
 
-            end = round((time.time() - start) * 1000)
-            logger.info(f'Channel {c} processed in {end} ms')
-            processed += 1
-            progress = round(processed / to_process * 100)
-            update_fileset_progress(progress)
+                        processed += 1
+
+                end = round((time.time() - start) * 1000)
+                logger.info(f'Level {level} Channel {c} processed in {end} ms')
+
+                progress = min(math.floor(processed / to_process * 100), 99)
+                update_fileset_progress(progress)
 
 
         # Add this new image to the list to be attached to this Fileset
@@ -378,7 +445,9 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
             'pyramid_levels': max_level + 1,
             'format': image_format,
             'compression': image_compression,
-            'tile_size': TILE_SIZE
+            'tile_size': TILE_SIZE,
+            'rgb': is_rgb,
+            'pixel_type': ome_pixel_type
         })
 
     xml_key = str(fileset_uuid / 'metadata.xml')
@@ -388,11 +457,10 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
     future = transfer_manager.upload(
         xml_buf, bucket, xml_key, extra_args=upload_args
     )
-    upload_futures.append(future)
-    for future in upload_futures:
-        future.result()
+    future.result()
+    update_fileset_progress(100)
 
-    print('Completing Fileset {} and registering images: {}'.format(
+    logger.info('Completing Fileset {} and registering images: {}'.format(
         fileset_uuid,
         ', '.join([image['uuid'] for image in images])
     ))
