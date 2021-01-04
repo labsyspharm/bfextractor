@@ -18,7 +18,6 @@ import skimage.transform
 import jnius
 import logging, time
 import tifffile
-import gc
 import zarr
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s - %(message)s')
@@ -32,49 +31,21 @@ def tile(img, tile_size):
         for xi, x in enumerate(range(0, img.shape[1], tile_size)):
             yield yi, xi, img[y:y+tile_size, x:x+tile_size]
 
-def build_pyramid(img, tile_size):
+
+def generate_pyramid_level(reader, index, dtype, tile_size, level):
     # Convert to float32 because otherwise pyramid_gaussian will convert image to float64
     # which reserves excessive memory
+    logger.info("Generate pyramid levels up to %s", level)
+    img = read_image_in_chunks(reader, index, dtype)
     original_dtype = img.dtype
     img = skimage.img_as_float32(img, False)
 
     max_layer = max(max(np.ceil(np.log2(np.array(img.shape) / tile_size))), 0)
     pyramid = skimage.transform.pyramid_gaussian(img, max_layer=max_layer, multichannel=False)
     for layer, layer_img in enumerate(pyramid):
-        for yi, xi, tile_img in tile(layer_img, tile_size):
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    'ignore', r'Possible precision loss', UserWarning,
-                    '^skimage\.util\.dtype'
-                )
-                tile_img = skimage.util.dtype.convert(tile_img, original_dtype)
-            yield layer, yi, xi, tile_img
-
-def get_pyramid(index, tile_size, dtype, faas_pyramid=False):
-    max_layer = reader.getResolutionCount() if not faas_pyramid else reader.getSeriesCount()
-    for layer in range(max_layer):
-        if not faas_pyramid:
-            reader.setResolution(layer)
-        else:
-            reader.setSeries(layer)
-
-        layer_img = read_image_in_chunks(reader, index, dtype)
-
-        for yi, xi, tile_img in tile(layer_img, tile_size):
-            tile_img = skimage.util.dtype.convert(tile_img, dtype)
-            yield layer, yi, xi, tile_img
-
-def build_pyramid_levels(img, tile_size):
-    # Convert to float32 because otherwise pyramid_gaussian will convert image to float64
-    # which reserves excessive memory
-    original_dtype = img.dtype
-    img = skimage.img_as_float32(img, False)
-
-    max_layer = max(max(np.ceil(np.log2(np.array(img.shape) / tile_size))), 0)
-    pyramid = skimage.transform.pyramid_gaussian(img, max_layer=max_layer, multichannel=False)
-    for layer, layer_img in enumerate(pyramid):
-        layer_img = skimage.util.dtype.convert(layer_img, original_dtype)
-        yield layer_img
+        if layer == level:
+            layer_img = skimage.util.dtype.convert(layer_img, original_dtype)
+            return layer_img
 
 def set_reader_pyramid_level(level, faas_pyramid=False):
     if not faas_pyramid:
@@ -86,23 +57,6 @@ def get_builtin_pyramid_level_data(index, level, dtype, faas_pyramid=False):
     set_reader_pyramid_level(level, faas_pyramid)
     layer_img = read_image_in_chunks(reader, index, dtype)
     return layer_img
-
-def get_generated_pyramid_level_data(index, dtype, faas_pyramid=False, pyramid_levels=None):
-    layer_img = read_image_in_chunks(reader, index, dtype)
-    if pyramid_levels is None:
-        logger.info("Building pyramid levels")
-        pyramid_levels = []
-        for level in build_pyramid(layer_img, TILE_SIZE):
-            pyramid_levels.append(level)
-
-    return pyramid_levels
-
-def builtin_pyramids(index, dtype, max_levels, faas_pyramid=False):
-    for level in range(max_levels):
-        set_reader_pyramid_level(level, faas_pyramid)
-
-        layer_img = read_image_in_chunks(reader, index, dtype)
-        yield layer_img
 
 def get_tile(pyramid_img, xi, yi, tile_size):
     return pyramid_img[yi*tile_size:(yi+1)*tile_size, xi*tile_size:(xi+1)*tile_size]
@@ -204,6 +158,7 @@ bucket = sys.argv[6]
 fileset_uuid = pathlib.Path(sys.argv[7])
 stack_prefix = os.environ['STACKPREFIX']
 stage = os.environ['STAGE']
+region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
 try:
     debug = os.environ['DEBUG'].upper() == 'TRUE'
@@ -370,8 +325,16 @@ def handle_tile(c, z, t, level, ty, tx, tile_img, upload_futures):
     )
     upload_futures.append(future)
 
-def get_max_level(faas_pyramid=False):
-    return reader.getResolutionCount() if not faas_pyramid else reader.getSeriesCount()
+def get_max_level(width, height, faas_pyramid=False, contains_pyramid=False, tile_size=1024):
+    if contains_pyramid:
+        return reader.getResolutionCount() if not faas_pyramid else reader.getSeriesCount()
+    else:
+        levels = 1
+        while width > tile_size and height > tile_size:
+            width = width // 2
+            height = height // 2
+            levels += 1
+        return levels
 
 
 with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_manager:
@@ -384,7 +347,7 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
     logger.info("RGB: %s", is_rgb)
     upload_args = dict(ContentType=tile_content_type)
 
-    s3 = s3fs.S3FileSystem(anon=False, client_kwargs=dict(region_name="us-east-1"))
+    s3 = s3fs.S3FileSystem(anon=False, client_kwargs=dict(region_name=region))
     compressor = zarr.Blosc(cname='zstd', clevel=3)
 
     for series in range(series_count):
@@ -402,10 +365,13 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
         s3_store = s3fs.S3Map(root=f"{bucket}/{img_id}", s3=s3, check=False)
         output = zarr.group(store=s3_store, overwrite=True)
 
-        max_level = get_max_level(faas_pyramid)
+        max_level = get_max_level(width, height, faas_pyramid, contains_pyramid, TILE_SIZE)
+        logger.info("Max level %s", max_level)
 
         for level in range(max_level):
-            set_reader_pyramid_level(level, faas_pyramid)
+            if contains_pyramid:
+                set_reader_pyramid_level(level, faas_pyramid)
+
             arr = output.create(shape=(reader.sizeT, reader.sizeC, reader.sizeZ, reader.sizeY, reader.sizeX),
                                 chunks=(1, 1, 1, TILE_SIZE, TILE_SIZE),
                                 name=str(level), dtype=dtype, compressor=compressor)
@@ -414,7 +380,10 @@ with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_
                 start = time.time()
                 logger.info("Reading Level=%s T=%s C=%s Z=%s", level, t, c, z)
                 index = reader.getIndex(z, c, t)
-                level_img = get_builtin_pyramid_level_data(index, level, dtype, faas_pyramid=faas_pyramid)
+                if contains_pyramid:
+                    level_img = get_builtin_pyramid_level_data(index, level, dtype, faas_pyramid=faas_pyramid)
+                else:
+                    level_img = generate_pyramid_level(reader, index, dtype, TILE_SIZE, level)
 
                 logger.info("Level shape=%s", level_img.shape)
 
