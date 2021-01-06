@@ -1,6 +1,8 @@
 version: '3'
 services:
   bfextractor:
+    stdin_open: true
+    tty: true
     build: .
     environment:
       AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION}"
@@ -11,19 +13,23 @@ services:
       STAGE: dev
       DEBUG: "True"
     volumes:
-      - /data:/tmp/aws
+      - C:\bfdata:/tmp/aws
     command:
       # Import UUID and also the directory name within /data
-      - importUuid
+      - afterpanel
       # Location of entrypoint within importUuid directory
-      - path/to/entrypoint/example.dv
-      # Identify for the Bio-Formats Reader
+      - afterpanel.rcpnl
+      # Identify for the Bio-Formats Reader, e.g.
+      # .rcpnl   -> loci.formats.in.DeltavisionReader
+      # .ome.tif -> loci.formats.in.OMETiffReader
       - loci.formats.in.DeltavisionReader
       # Reader Software Name
       - Bio-Formats
       # Reader Software Version
       - UNKNOWN
       # Bucket in which to write tiles
-      - jmuhlich-bfextractor-test
+      # Use file:path for writing tiles to local file (for testing purposes)
+      - jruokonen-bfextractor-test
+      #- file:zarrtest
       # BFU UUID
       - bfuUuid

@@ -1,0 +1,19 @@
+version: '3'
+services:
+  bfextractor:
+    build: ..
+    environment:
+      AWS_DEFAULT_REGION: "us-east-1"
+      STACKPREFIX: minerva-test
+      STAGE: dev
+      DEBUG: "True"
+    volumes:
+      - .:/tmp/aws
+    command:
+      - testimages
+      - 2048x2048_ome5.ome.tif
+      - loci.formats.in.OMETiffReader
+      - Bio-Formats
+      - UNKNOWN
+      - file:test_output/bf5_pyramid
+      - bfuUuid

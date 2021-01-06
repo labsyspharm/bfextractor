@@ -1,5 +1,4 @@
 import math
-import warnings
 import sys
 import os
 import io
@@ -10,14 +9,11 @@ import json
 from xml.etree import ElementTree
 import boto3
 import s3fs
-import s3transfer.manager
-import s3transfer.subscribers
 import numpy as np
 import skimage.io
 import skimage.transform
 import jnius
 import logging, time
-import tifffile
 import zarr
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s - %(message)s')
@@ -25,6 +21,32 @@ logger = logging.getLogger("minerva")
 logger.setLevel(logging.INFO)
 
 OME_NS = 'http://www.openmicroscopy.org/Schemas/OME/2016-06'
+
+import_uuid = pathlib.Path(sys.argv[1])
+filename = pathlib.Path(sys.argv[2])
+reader_class_name = sys.argv[3]
+reader_software = sys.argv[4]
+reader_version = sys.argv[5]
+bucket = sys.argv[6]
+if "file:" in bucket:
+    # output to local file if there is "file:" in bucket name
+    local_storage = True
+    local_dir = bucket.split('file:')[1]
+else:
+    local_storage = False
+
+fileset_uuid = pathlib.Path(sys.argv[7])
+stack_prefix = os.environ['STACKPREFIX']
+stage = os.environ['STAGE']
+region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+try:
+    debug = os.environ['DEBUG'].upper() == 'TRUE'
+except KeyError:
+    debug = False
+
+TILE_SIZE = 1024
+IMAGE_NAME_LENGTH = 256
 
 def tile(img, tile_size):
     for yi, y in enumerate(range(0, img.shape[0], tile_size)):
@@ -117,14 +139,6 @@ def update_fileset_progress(progress):
             }))
         )
 
-class ProgressSubscriber(s3transfer.subscribers.BaseSubscriber):
-
-    def __init__(self, img_id, filename):
-        self.subkey = f'{img_id}/{filename}'
-
-    def on_done(self, future, **kwargs):
-        print(f'Upload completed: {self.subkey}')
-
 # The wrapper for Field provided by jnius only includes a few methods, and 'get'
 # is not one of them. We'll monkey-patch it in here.
 jnius.reflect.Field.get = jnius.reflect.JavaMethod(
@@ -147,26 +161,6 @@ IFD = jnius.autoclass('loci.formats.tiff.IFD')
 OMEXMLMetadataImpl = jnius.autoclass('loci.formats.ome.OMEXMLMetadataImpl')
 
 DebugTools.enableLogging(JString("ERROR"))
-
-
-import_uuid = pathlib.Path(sys.argv[1])
-filename = pathlib.Path(sys.argv[2])
-reader_class_name = sys.argv[3]
-reader_software = sys.argv[4]
-reader_version = sys.argv[5]
-bucket = sys.argv[6]
-fileset_uuid = pathlib.Path(sys.argv[7])
-stack_prefix = os.environ['STACKPREFIX']
-stage = os.environ['STAGE']
-region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-
-try:
-    debug = os.environ['DEBUG'].upper() == 'TRUE'
-except KeyError:
-    debug = False
-
-TILE_SIZE = 1024
-IMAGE_NAME_LENGTH = 256
 
 s3 = boto3.client('s3')
 lmb = boto3.client('lambda')
@@ -215,9 +209,6 @@ except KeyError as e:
     raise RuntimeError(msg) from None
 
 dtype = dtype.newbyteorder("<" if reader.isLittleEndian() else ">")
-
-# FIXME Consider other file types to support higher-depth pixel formats.
-tile_ext = 'tif'
 tile_content_type = 'image/zarr'
 image_format = 'zarr'
 image_compression = 'zstd'
@@ -304,143 +295,129 @@ def read_image_in_chunks(reader, index, dtype):
     return img
 
 
-transfer_config = s3transfer.manager.TransferConfig(max_request_queue_size=500, max_submission_queue_size=500)
-
-
-def handle_tile(c, z, t, level, ty, tx, tile_img, upload_futures):
-    global filename, future
-    logger.info(f'Tile C={c} level={level} x={tx} y={ty}')
-    filename = f'C{c}-T{t}-Z{z}-L{level}-Y{ty}-X{tx}.{tile_ext}'
-    buf = io.BytesIO()
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            'ignore', r'.* is a low contrast image', UserWarning,
-            '^skimage\.io'
-        )
-        tifffile.imwrite(buf, tile_img, compress=("ZSTD", 1))
-    buf.seek(0)
-    tile_key = f'{img_id}/{filename}'
-    future = transfer_manager.upload(
-        buf, bucket, tile_key, extra_args=upload_args
-    )
-    upload_futures.append(future)
-
 def get_max_level(width, height, faas_pyramid=False, contains_pyramid=False, tile_size=1024):
     if contains_pyramid:
         return reader.getResolutionCount() if not faas_pyramid else reader.getSeriesCount()
     else:
-        levels = 1
-        while width > tile_size and height > tile_size:
-            width = width // 2
-            height = height // 2
-            levels += 1
-        return levels
+        return max(int(max(np.ceil(np.log2(np.array((height, width)) / tile_size))))+1, 1)
 
 
-with s3transfer.manager.TransferManager(s3, config=transfer_config) as transfer_manager:
-    image_id_map = {}
-    images = []
-    processed = 0
-    to_process = count_processed(reader, series_count)
-    logger.info("Tiles to process %s", to_process)
-    is_rgb = reader.isRGB()
-    logger.info("RGB: %s", is_rgb)
-    upload_args = dict(ContentType=tile_content_type)
+image_id_map = {}
+images = []
+processed = 0
+to_process = count_processed(reader, series_count)
+logger.info("Tiles to process %s", to_process)
+is_rgb = reader.isRGB()
+logger.info("RGB: %s", is_rgb)
+upload_args = dict(ContentType=tile_content_type)
 
-    s3 = s3fs.S3FileSystem(anon=False, client_kwargs=dict(region_name=region))
-    compressor = zarr.Blosc(cname='zstd', clevel=3)
+s3 = s3fs.S3FileSystem(anon=False, client_kwargs=dict(region_name=region), asynchronous=False)
+compressor = zarr.Blosc(cname='zstd', clevel=3)
 
-    for series in range(series_count):
-        reader.setSeries(series)
-        rc = range(reader.sizeC)
-        rz = range(reader.sizeZ)
-        rt = range(reader.sizeT)
-        width = reader.sizeX
-        height = reader.sizeY
-        img_id = str(uuid.uuid4())
-        old_xml_id = metadata.getImageID(series)
-        image_id_map[old_xml_id] = f'Image:{img_id}'
-        logger.info(f'Allocated ID for series {series}: {img_id}')
+for series in range(series_count):
+    reader.setSeries(series)
+    rc = range(reader.sizeC)
+    rz = range(reader.sizeZ)
+    rt = range(reader.sizeT)
+    width = reader.sizeX
+    height = reader.sizeY
+    img_id = str(uuid.uuid4())
+    old_xml_id = metadata.getImageID(series)
+    image_id_map[old_xml_id] = f'Image:{img_id}'
+    logger.info(f'Allocated ID for series {series}: {img_id}')
 
-        s3_store = s3fs.S3Map(root=f"{bucket}/{img_id}", s3=s3, check=False)
-        output = zarr.group(store=s3_store, overwrite=True)
+    if not local_storage:
+        zarr_store = s3fs.S3Map(root=f"{bucket}/{img_id}", s3=s3, check=False)
+    else:
+        zarr_store = zarr.DirectoryStore(local_dir)
 
-        max_level = get_max_level(width, height, faas_pyramid, contains_pyramid, TILE_SIZE)
-        logger.info("Max level %s", max_level)
+    output = zarr.group(store=zarr_store, overwrite=True)
+    max_level = get_max_level(width, height, faas_pyramid, contains_pyramid, TILE_SIZE)
+    logger.info("Max level %s", max_level)
 
-        for level in range(max_level):
+    for level in range(max_level):
+        if contains_pyramid:
+            set_reader_pyramid_level(level, faas_pyramid)
+            sizeX = reader.sizeX
+            sizeY = reader.sizeY
+        else:
+            sizeX = width / 2**level
+            sizeY = height / 2**level
+
+        arr = output.create(shape=(reader.sizeT, reader.sizeC, reader.sizeZ, sizeY, sizeX),
+                            chunks=(1, 1, 1, TILE_SIZE, TILE_SIZE),
+                            name=str(level), dtype=dtype, compressor=compressor)
+        logger.info("Created zarr array %s", arr.shape)
+
+        for c, z, t in itertools.product(rc, rz, rt):
+            start = time.time()
+            logger.info("Reading Level=%s T=%s C=%s Z=%s", level, t, c, z)
+            index = reader.getIndex(z, c, t)
             if contains_pyramid:
-                set_reader_pyramid_level(level, faas_pyramid)
+                level_img = get_builtin_pyramid_level_data(index, level, dtype, faas_pyramid=faas_pyramid)
+            else:
+                level_img = generate_pyramid_level(reader, index, dtype, TILE_SIZE, level)
 
-            arr = output.create(shape=(reader.sizeT, reader.sizeC, reader.sizeZ, reader.sizeY, reader.sizeX),
-                                chunks=(1, 1, 1, TILE_SIZE, TILE_SIZE),
-                                name=str(level), dtype=dtype, compressor=compressor)
-            logger.info("Created zarr array %s", arr.shape)
-            for c, z, t in itertools.product(rc, rz, rt):
-                start = time.time()
-                logger.info("Reading Level=%s T=%s C=%s Z=%s", level, t, c, z)
-                index = reader.getIndex(z, c, t)
-                if contains_pyramid:
-                    level_img = get_builtin_pyramid_level_data(index, level, dtype, faas_pyramid=faas_pyramid)
-                else:
-                    level_img = generate_pyramid_level(reader, index, dtype, TILE_SIZE, level)
+            logger.info("Level shape=%s", level_img.shape)
 
-                logger.info("Level shape=%s", level_img.shape)
+            tiles_height = math.ceil(level_img.shape[0] / TILE_SIZE)
+            tiles_width = math.ceil(level_img.shape[1] / TILE_SIZE)
+            for yi in range(tiles_height):
+                for xi in range(tiles_width):
+                    tile = get_tile(level_img, xi, yi, TILE_SIZE)
+                    logger.info("Tile X=%s Y=%s shape=%s", xi, yi, tile.shape)
 
-                tiles_height = math.ceil(level_img.shape[0] / TILE_SIZE)
-                tiles_width = math.ceil(level_img.shape[1] / TILE_SIZE)
-                for yi in range(tiles_height):
-                    for xi in range(tiles_width):
-                        tile = get_tile(level_img, xi, yi, TILE_SIZE)
-                        logger.info("Tile X=%s Y=%s shape=%s", xi, yi, tile.shape)
+                    arr[t, c, z,
+                    yi * TILE_SIZE:yi * TILE_SIZE + tile.shape[0],
+                    xi * TILE_SIZE:xi * TILE_SIZE + tile.shape[1]] = tile
 
-                        arr[t, c, z,
-                            yi*TILE_SIZE:yi*TILE_SIZE+tile.shape[0],
-                            xi*TILE_SIZE:xi*TILE_SIZE+tile.shape[1]] = tile
+                    processed += 1
 
-                        processed += 1
+            end = round((time.time() - start) * 1000)
+            logger.info(f'Level {level} Channel {c} processed in {end} ms')
 
-                end = round((time.time() - start) * 1000)
-                logger.info(f'Level {level} Channel {c} processed in {end} ms')
-
-                progress = min(math.floor(processed / to_process * 100), 99)
-                update_fileset_progress(progress)
+            progress = min(math.floor(processed / to_process * 100), 99)
+            update_fileset_progress(progress)
 
 
-        # Add this new image to the list to be attached to this Fileset
-        images.append({
-            'uuid': img_id,
-            'name': mk_name(file_path, series),
-            'pyramid_levels': max_level + 1,
-            'format': image_format,
-            'compression': image_compression,
-            'tile_size': TILE_SIZE,
-            'rgb': is_rgb,
-            'pixel_type': ome_pixel_type
-        })
+    # Add this new image to the list to be attached to this Fileset
+    images.append({
+        'uuid': img_id,
+        'name': mk_name(file_path, series),
+        'pyramid_levels': max_level + 1,
+        'format': image_format,
+        'compression': image_compression,
+        'tile_size': TILE_SIZE,
+        'rgb': is_rgb,
+        'pixel_type': ome_pixel_type
+    })
 
-    xml_key = str(fileset_uuid / 'metadata.xml')
-    xml_bytes = transform_xml(metadata, image_id_map)
-    xml_buf = io.BytesIO(xml_bytes)
-    upload_args = dict(ContentType='application/xml')
-    future = transfer_manager.upload(
-        xml_buf, bucket, xml_key, extra_args=upload_args
+# Upload metadata.xml to S3
+xml_key = str(fileset_uuid / 'metadata.xml')
+xml_bytes = transform_xml(metadata, image_id_map)
+xml_buf = io.BytesIO(xml_bytes)
+if not local_storage:
+    s3_client = boto3.client('s3')
+    s3_client.put_object(Body=xml_buf, Bucket=bucket, Key=xml_key, ContentType='application/xml')
+else:
+    with open(local_dir + "/metadata.xml", "wb") as metadata_file:
+        metadata_file.write(xml_buf.getbuffer())
+
+update_fileset_progress(100)
+
+logger.info('Completing Fileset {} and registering images: {}'.format(
+    fileset_uuid,
+    ', '.join([image['uuid'] for image in images])
+))
+
+if not debug:
+    lmb.invoke(
+        FunctionName=set_fileset_complete_arn,
+        Payload=str.encode(json.dumps({
+            'fileset_uuid': str(fileset_uuid),
+            'images': images,
+            'complete': 'True'
+        }))
     )
-    future.result()
-    update_fileset_progress(100)
-
-    logger.info('Completing Fileset {} and registering images: {}'.format(
-        fileset_uuid,
-        ', '.join([image['uuid'] for image in images])
-    ))
-
-    if not debug:
-
-        lmb.invoke(
-            FunctionName=set_fileset_complete_arn,
-            Payload=str.encode(json.dumps({
-                'fileset_uuid': str(fileset_uuid),
-                'images': images,
-                'complete': 'True'
-            }))
-        )
+else:
+    logger.info("Skip setting fileset complete because using local file output")
